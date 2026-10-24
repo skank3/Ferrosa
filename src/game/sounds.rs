@@ -2,7 +2,12 @@ use std::{f64::consts::PI, io::Cursor, num::NonZero, path::Path};
 
 use bevy::{platform::collections::HashMap, prelude::*};
 use ferrosa_protocol::clientbound::game::{GameState, ItemKind, events::sound::Sound};
-use rodio::{Decoder, Source, SpatialPlayer, buffer::SamplesBuffer, mixer::Mixer};
+use ferrosa_world::skeleton::BoneId;
+use rodio::{
+    Decoder, Source, SpatialPlayer,
+    buffer::SamplesBuffer,
+    mixer::{self, Mixer},
+};
 
 use super::{
     GAME_FPS,
@@ -10,14 +15,33 @@ use super::{
     netgame::{NetEvent, NetGame},
     smoothing::Smoothing,
 };
-use crate::{audio::Speakers, config::Config, menu::Screen};
+use crate::{
+    audio::Speakers,
+    character_model::HumanPose,
+    config::Config,
+    game::{
+        human_sync::{NetHuman, bone_at},
+        sounds,
+    },
+    menu::Screen,
+};
 
 const RATE: u32 = 48000;
-const GUNS: [(ItemKind, &str); 5] = [(ItemKind::Ak47, "ak47"), (ItemKind::M16, "m16"), (ItemKind::Mp5, "mp5"), (ItemKind::Uzi, "uzi"), (ItemKind::Pistol, "pistol")];
+const GUNS: [(ItemKind, &str); 5] =
+    [(ItemKind::Ak47, "ak47"), (ItemKind::M16, "m16"), (ItemKind::Mp5, "mp5"), (ItemKind::Uzi, "uzi"), (ItemKind::Pistol, "pistol")];
 const NEAR: f32 = 1.0;
 const SHORT: f32 = 10.0;
 const FAR: f32 = 32.0;
 const GLASS_PITCH: (f32, f32) = (0.75, 0.75 + 255.0 / 512.0);
+
+const STEP_MARGIN: f32 = 0.03;
+const STEP_SPEED: f32 = 0.5; // how many m/s to count as moving
+
+#[derive(Component, Default)]
+struct Stride {
+    planted: Option<usize>,
+    last_pos: Option<Vec3>,
+}
 
 #[derive(Clone)]
 struct Clip {
@@ -27,6 +51,7 @@ struct Clip {
 
 #[derive(Resource)]
 struct GameSounds {
+    footsteps: Vec<Clip>,
     guns: HashMap<ItemKind, Vec<Clip>>,
     ricochets: Vec<Clip>,
     body: Vec<Clip>,
@@ -85,6 +110,7 @@ impl Plugin for SoundsPlugin {
             .init_resource::<Playing>()
             .add_systems(Startup, load_sounds)
             .add_systems(Update, (hear, play_sounds, keep_playing).chain().after(Smoothing::View).run_if(in_state(Screen::InGame)))
+            .add_systems(Update, footsteps.after(Smoothing::Glide).before(keep_playing).run_if(in_state(Screen::InGame)).run_if(resource_exists::<NetGame>))
             .add_systems(OnExit(Screen::InGame), |mut playing: ResMut<Playing>| playing.0.clear());
     }
 }
@@ -127,6 +153,7 @@ fn load_sounds(mut commands: Commands) {
     server.insert(Sound::PhoneBusy as u8, tone(10));
 
     commands.insert_resource(GameSounds {
+        footsteps: numbered("footstep", 4, NEAR),
         guns: GUNS.iter().map(|&(kind, name)| (kind, numbered(&format!("{name}_fire"), 6, SHORT))).collect(),
         ricochets: numbered("ricochet", 8, SHORT),
         body: numbered("bullethitbody", 2, SHORT),
@@ -136,6 +163,54 @@ fn load_sounds(mut commands: Commands) {
         shell: file("shell_hit_cement", 2.0),
         server,
     });
+}
+
+fn footsteps(
+    mut commands: Commands,
+    time: Res<Time>,
+    net: Res<NetGame>,
+    sounds: Option<Res<GameSounds>>,
+    speakers: Res<Speakers>,
+    ears: Res<Ears>,
+    mut playing: ResMut<Playing>,
+    mut humans: Query<(Entity, &NetHuman, &Transform, &HumanPose, Option<&mut Stride>)>,
+) {
+    let (Some(sounds), Some(mixer)) = (sounds, speakers.0.as_ref()) else { return };
+
+    for (e, nh, at, pose, stride) in &mut humans {
+        let Some(mut stride) = stride else {
+            commands.entity(e).insert(Stride::default());
+            continue;
+        };
+        let Some(h) = net.humans.get(nh.0) else { continue };
+
+        let pos = at.translation;
+        let speed = stride.last_pos.map_or(0.0, |p| (pos - p).with_y(0.0).length() / time.delta_secs().max(1e-4));
+        stride.last_pos = Some(pos);
+
+        if !h.alive || h.vehicle >= 0 || speed < STEP_SPEED {
+            stride.planted = None; // re-arm so the first step after stopping still plays
+            continue;
+        }
+
+        let feet = [BoneId::FootLeft, BoneId::FootRight].map(|b| bone_at(pos, pose, b.index()).0);
+        let lower = match feet[0].y - feet[1].y {
+            d if d < -STEP_MARGIN => 0,
+            d if d > STEP_MARGIN => 1,
+            _ => continue, // inside the hysteresis band: keep the current foot
+        };
+
+        if stride.planted.is_some_and(|f| f != lower) {
+            if let Some(clip) = pick(&sounds.footsteps) {
+                let emitter = Emitter::new(mixer, feet[lower], clip.radius, &ears);
+                emitter.player().set_volume(0.5 * ears.volume);
+                emitter.player().set_speed(rand::random_range(0.9..1.1));
+                emitter.player().append(clip.buffer.clone());
+                playing.0.push((emitter, 0.5));
+            }
+        }
+        stride.planted = Some(lower);
+    }
 }
 
 fn dial_tone(key: usize) -> Vec<f32> {
@@ -176,7 +251,13 @@ fn pick(clips: &[Clip]) -> Option<&Clip> {
     clips.get(rand::random_range(0..clips.len().max(1)))
 }
 
-fn play_sounds(mut happenings: MessageReader<NetEvent>, sounds: Option<Res<GameSounds>>, speakers: Res<Speakers>, ears: Res<Ears>, mut playing: ResMut<Playing>) {
+fn play_sounds(
+    mut happenings: MessageReader<NetEvent>,
+    sounds: Option<Res<GameSounds>>,
+    speakers: Res<Speakers>,
+    ears: Res<Ears>,
+    mut playing: ResMut<Playing>,
+) {
     let (Some(sounds), Some(mixer)) = (sounds, speakers.0.as_ref()) else { return };
 
     for happening in happenings.read() {
@@ -191,7 +272,9 @@ fn play_sounds(mut happenings: MessageReader<NetEvent>, sounds: Option<Res<GameS
                 };
                 (pick(clips), pos, 1.0, 1.0)
             }
-            NetEvent::BulletHole { pos, face: 0.., .. } | NetEvent::WindowBroke { pos, .. } => (Some(&sounds.glass), pos, 1.0, rand::random_range(GLASS_PITCH.0..GLASS_PITCH.1)),
+            NetEvent::BulletHole { pos, face: 0.., .. } | NetEvent::WindowBroke { pos, .. } => {
+                (Some(&sounds.glass), pos, 1.0, rand::random_range(GLASS_PITCH.0..GLASS_PITCH.1))
+            }
             NetEvent::Explosion { pos } => (Some(&sounds.explosion), pos, 1.0, 1.0),
             NetEvent::Sound { sound, pos, volume, pitch } => (sounds.server.get(&(sound as u8)), pos, volume, pitch),
             NetEvent::BulletHole { .. } => (None, Vec3::ZERO, 0.0, 1.0),
